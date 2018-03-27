@@ -1,0 +1,293 @@
+import pandas as pd
+import numpy as np
+import pickle
+import tensorflow as tf
+import time
+
+
+
+def xavier_initializer(n_inputs, n_outputs, uniform = True):
+    if uniform:
+        init_range = tf.sqrt(6.0/ (n_inputs + n_outputs))
+        return tf.random_uniform_initializer(-init_range, init_range)
+
+    else:
+        stddev = tf.sqrt(3.0 / (n_inputs + n_outputs))
+        return tf.truncated_normal_initializer(stddev=stddev)
+
+with open('train','rb') as mysavedata:
+    data = pickle.load(mysavedata)
+with open('test','rb') as mysavedata:
+    test = pickle.load(mysavedata)
+
+
+label = data[:,-1]
+label=np.reshape(label,[-1,1])
+data = data[:,:11]
+
+labely = test[:,-1]
+labely=np.reshape(labely,[-1,1])
+datay = test[:,:11]
+
+Y = tf.placeholder('float',[None,1])
+X = tf.placeholder('float',[None,11])
+WF=tf.get_variable("WF",shape=[11,128],initializer=xavier_initializer(11,128))
+b = tf.get_variable('b', shape=[128], dtype=tf.float32, initializer=tf.zeros_initializer(),
+                            trainable=True)
+predata= tf.matmul(X,WF)+b
+predata=tf.nn.relu(predata)
+predata = tf.reshape(predata,[-1,8,16])
+step =8
+dim=16
+label=np.array(label)
+Z = tf.placeholder('float')
+
+
+
+
+
+
+
+import tensorflow.contrib as tfc
+
+is_training = tf.placeholder(tf.bool)
+
+def conv1d_weightnorm(inputs, layer_idx, out_dim, kernel_size, padding="SAME", dropout=0.7,
+                      var_scope_name="conv_layer"):
+
+    with tf.variable_scope("conv_layer_" + str(layer_idx)):
+        in_dim = int(inputs.get_shape()[-1])
+        V = tf.get_variable('V', shape=[kernel_size, in_dim, out_dim], dtype=tf.float32,
+                            initializer=tf.random_normal_initializer(mean=0, stddev=tf.sqrt(
+                                4.0 * dropout / (kernel_size * in_dim))), trainable=True)
+        V_norm = tf.norm(V.initialized_value(), axis=[0, 1])  # V shape is M*N*k,  V_norm shape is k
+        g = tf.get_variable('g', dtype=tf.float32, initializer=V_norm, trainable=True)
+        b = tf.get_variable('b', shape=[out_dim], dtype=tf.float32, initializer=tf.zeros_initializer(), trainable=True)
+
+
+        W = tf.reshape(g, [1, 1, out_dim]) * tf.nn.l2_normalize(V, [0, 1])
+        inputs = tf.nn.bias_add(tf.nn.conv1d(value=inputs, filters=W, stride=1, padding=padding), b)
+        return inputs
+
+def linear_mapping_weightnorm(inputs, out_dim, in_dim=None, dropout=0.7, var_scope_name="linear_mapping"):
+    with tf.variable_scope(var_scope_name):
+        input_shape = inputs.get_shape().as_list()
+        input_shape_tensor = tf.shape(inputs)
+
+        V = tf.get_variable('V', shape=[int(input_shape[-1]), out_dim], dtype=tf.float32,
+                            initializer=tf.random_normal_initializer(mean=0, stddev=tf.sqrt(
+                                dropout * 1.0 / int(input_shape[-1]))), trainable=True)
+        V_norm = tf.norm(V.initialized_value(), axis=0)  # V shape is M*N,  V_norm shape is N
+        g = tf.get_variable('g', dtype=tf.float32, initializer=V_norm, trainable=True)
+        b = tf.get_variable('b', shape=[out_dim], dtype=tf.float32, initializer=tf.zeros_initializer(),
+                            trainable=True)
+
+        assert len(input_shape) == 3
+        inputs = tf.reshape(inputs, [-1, input_shape[-1]])
+        inputs = tf.matmul(inputs, V)
+        inputs = tf.reshape(inputs, [input_shape_tensor[0], -1, out_dim])
+
+
+        scaler = tf.div(g, tf.norm(V, axis=0))
+        inputs = tf.reshape(scaler, [1, out_dim]) * inputs + tf.reshape(b, [1, out_dim])
+        return inputs
+
+def gated_linear_units(inputs):
+  input_shape = inputs.get_shape().as_list()
+  assert len(input_shape) == 3
+  input_pass = inputs[:,:,0:int(input_shape[2]/2)]
+  input_gate = inputs[:,:,int(input_shape[2]/2):]
+  input_gate = tf.sigmoid(input_gate)
+  return tf.multiply(input_pass, input_gate)
+
+def conv_encoder_stack(inputs, nhids_list, kwidths_list, dropout_dict,is_training):
+    next_layer = inputs
+    for layer_idx in range(len(nhids_list)):
+        nin = nhids_list[layer_idx] if layer_idx == 0 else nhids_list[layer_idx - 1]
+        nout = nhids_list[layer_idx]
+        res_inputs = next_layer
+
+        if layer_idx == 1:
+            next_layer = tf.contrib.layers.dropout(
+                inputs=next_layer,
+                keep_prob=dropout_dict['hid'], is_training=is_training)
+
+            next_layer = conv1d_weightnorm(inputs=next_layer, layer_idx=layer_idx, out_dim=nout * 2,
+                                       kernel_size=kwidths_list[layer_idx], padding="SAME", dropout=dropout_dict['hid'],
+                                       var_scope_name="conv_layer_" + str(layer_idx))
+
+            next_layer = tf.contrib.layers.conv2d(inputs=next_layer,num_outputs=nout*2,kernel_size=kwidths_list[layer_idx],
+                                              padding="SAME",   weights_initializer=tf.random_normal_initializer(mean=0, stddev=tf.sqrt(4 * dropout_dict['hid'] / (kwidths_list[layer_idx] * next_layer.get_shape().as_list()[-1]))),biases_initializer=tf.zeros_initializer(),activation_fn=None,scope="conv_layer_"+str(layer_idx))
+            next_layer = gated_linear_units(next_layer)
+            next_layer = (next_layer + res_inputs) * tf.sqrt(0.5)
+            next_layer = tf.nn.pool(next_layer, [2], 'MAX', 'SAME', strides=[1])
+
+        elif layer_idx == 2:
+            next_layer = tf.contrib.layers.dropout(
+                inputs=next_layer,
+                keep_prob=dropout_dict['hid'], is_training=is_training)
+
+            next_layer = conv1d_weightnorm(inputs=next_layer, layer_idx=layer_idx, out_dim=nout * 2,
+                                           kernel_size=kwidths_list[layer_idx], padding="SAME",
+                                           dropout=dropout_dict['hid'],
+                                           var_scope_name="conv_layer_" + str(layer_idx))
+
+            next_layer = tf.contrib.layers.conv2d(inputs=next_layer, num_outputs=nout * 2,
+                                                  kernel_size=kwidths_list[layer_idx],
+                                                  padding="SAME",
+                                                  weights_initializer=tf.random_normal_initializer(mean=0,
+                                                                                                   stddev=tf.sqrt(
+                                                                                                       4 * dropout_dict[
+                                                                                                           'hid'] / (
+                                                                                                               kwidths_list[
+                                                                                                                   layer_idx] *
+                                                                                                               next_layer.get_shape().as_list()[
+                                                                                                                   -1]))),
+                                                  biases_initializer=tf.zeros_initializer(), activation_fn=None,
+                                                  scope="conv_layer_" + str(layer_idx))
+
+            next_layer = gated_linear_units(next_layer)
+            next_layer = (next_layer + res_inputs) * tf.sqrt(0.5)
+            next_layer = tf.nn.pool(next_layer, [2], 'MAX', 'SAME', strides=[1])
+
+        elif layer_idx == 3:
+            next_layer = tf.contrib.layers.dropout(
+                inputs=next_layer,
+                keep_prob=dropout_dict['hid'], is_training=is_training)
+
+            next_layer = conv1d_weightnorm(inputs=next_layer, layer_idx=layer_idx, out_dim=nout * 2,
+                                           kernel_size=kwidths_list[layer_idx], padding="SAME",
+                                           dropout=dropout_dict['hid'],
+                                           var_scope_name="conv_layer_" + str(layer_idx))
+
+            next_layer = tf.contrib.layers.conv2d(inputs=next_layer, num_outputs=nout * 2,
+                                                  kernel_size=kwidths_list[layer_idx],
+                                                  padding="SAME",
+                                                  weights_initializer=tf.random_normal_initializer(mean=0,
+                                                                                                   stddev=tf.sqrt(
+                                                                                                       4 * dropout_dict[
+                                                                                                           'hid'] / (
+                                                                                                               kwidths_list[
+                                                                                                                   layer_idx] *
+                                                                                                               next_layer.get_shape().as_list()[
+                                                                                                                   -1]))),
+                                                  biases_initializer=tf.zeros_initializer(), activation_fn=None,
+                                                  scope="conv_layer_" + str(layer_idx))
+
+            next_layer = gated_linear_units(next_layer)
+            next_layer = (next_layer + res_inputs) * tf.sqrt(0.5)
+
+
+    return next_layer
+
+def encode( inputs):
+    embed_size = inputs.get_shape().as_list()[-1]
+
+    with tf.variable_scope("encoder_cnn"):
+        next_layer = inputs
+        if 4 > 0:
+            nhids_list = [128,128,128,128]
+            kwidths_list = [3,3,3,3]
+            # mapping emb dim to hid dim
+            next_layer = linear_mapping_weightnorm(next_layer, nhids_list[0],
+                                                   dropout=0.7,
+                                                   var_scope_name="linear_mapping_before_cnn")
+            next_layer = conv_encoder_stack(next_layer, nhids_list, kwidths_list,
+                                            {'src': 0.7,
+                                             'hid': 0.7}, is_training)
+
+            next_layer = linear_mapping_weightnorm(next_layer, embed_size, var_scope_name="linear_mapping_after_cnn")
+
+        cnn_c_output = (next_layer + inputs) * tf.sqrt(0.5)
+
+    final_state = tf.reduce_mean(cnn_c_output, 1)
+
+    return  next_layer,final_state,cnn_c_output
+
+def liner(lay2):
+    lay2 = tf.reshape(lay2, [-1, step*dim])
+    W3 = tf.get_variable("W2", shape=[step*dim, 11], initializer=tfc.layers.xavier_initializer(step*dim,11))
+    b1 = tf.get_variable('bw', shape=[11], dtype=tf.float32, initializer=tf.zeros_initializer(),
+                        trainable=True)
+    fw = tf.matmul(lay2, W3) + b1
+    fii =tf.nn.leaky_relu(fw)
+
+    W3 = tf.get_variable("Wq", shape=[11, 1], initializer=tfc.layers.xavier_initializer(11, 1))
+    b = tf.get_variable('bq', shape=[1], dtype=tf.float32, initializer=tf.zeros_initializer(),
+                        trainable=True)
+    f = tf.matmul(fii, W3) + b
+    fi = tf.nn.sigmoid(f)
+    return f , fi
+
+def train(c,Y,z):
+
+    cost =  tf.reduce_mean(tf.square(c - Y))
+    optimizer = tf.train.AdamOptimizer(learning_rate=z).minimize(cost)
+    return cost,optimizer
+
+def final(X,Y,z):
+
+    li2=encode(X)
+    l,x,c =li2
+    f, fi=liner(l)
+    cost=train(f,Y,z)
+    return cost ,f
+
+def acc(con):
+    c=[]
+    t=tf.cast(tf.less(0.93,con), dtype=tf.float32)
+    k=tf.cast(tf.less(con,1.07), dtype=tf.float32)
+    p = tf.cast(tf.equal(t, k), dtype=tf.float32)
+
+    accc=tf.reduce_mean(p)
+    return accc,p
+
+def pred(logic,label):
+    pre = logic
+    lab=label
+    c=[]
+    for i in range(len(test)):
+        d=(pre[i]+0.0000000000001)/(lab[i]+0.0000000000001)
+        c.append(d)
+    acc = tf.reduce_mean(c)
+
+    return pre, acc, c
+v=0.001
+v1=0.0001
+
+with tf.variable_scope("en")as scopes:
+    cost,h=final(predata,Y,Z)
+    tf.get_variable_scope().reuse_variables()
+    li=encode(predata)
+    cv,x,c=li
+    q,w =liner(cv)
+    out = q
+    pr,a,con=pred(out,Y)
+
+    con,t=acc(con)
+
+
+
+
+
+
+
+saver = tf.train.Saver()
+init_op = tf.global_variables_initializer()
+
+with tf.Session() as sess:
+    sess.run(init_op)
+    save_path = "./save10/model.ckpt"
+    saver.restore(sess, save_path)
+    testp = sess.run(pr, feed_dict={X: datay, Y: labely, is_training: False})
+    testY = np.array(labely)
+    testa = sess.run(con, feed_dict={X: datay, Y: labely, is_training: False})
+    print(testa)
+    import matplotlib.pyplot as plt
+
+    start_time = time.time()
+    plt.plot(testY)
+    plt.plot(testp)
+    plt.show()
+    print("start_time", start_time)
+    print("--- %s seconds ---" % (time.time() - start_time))
